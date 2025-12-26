@@ -75,7 +75,8 @@ class SlackDraftService:
         self.genai_client = genai.Client(api_key=GEMINI_API_KEY)
         self.model_name = 'gemini-2.5-flash'
         self.processed_messages = set()
-        self.last_check_ts = str(time.time())
+        # Look back 1 hour at startup to catch recent threads
+        self.last_check_ts = str(time.time() - 3600)
         self.bot_user_id = None  # Set in run() via auth_test()
 
         # Supported refinement commands
