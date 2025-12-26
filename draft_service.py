@@ -9,6 +9,7 @@ import sys
 import time
 import re
 from typing import Optional
+from collections import deque
 
 # Force unbuffered output for Railway logs
 sys.stdout.reconfigure(line_buffering=True)
@@ -74,7 +75,7 @@ class SlackDraftService:
         self.slack_client = WebClient(token=SLACK_BOT_TOKEN)
         self.genai_client = genai.Client(api_key=GEMINI_API_KEY)
         self.model_name = 'gemini-2.5-flash'
-        self.processed_messages = set()
+        self.processed_messages = deque(maxlen=500)  # Auto-evicts oldest when full
         # Look back 1 hour at startup to catch recent threads
         self.last_check_ts = str(time.time() - 3600)
         self.bot_user_id = None  # Set in run() via auth_test()
@@ -113,20 +114,34 @@ class SlackDraftService:
         return mention_pattern in text
 
     def parse_command(self, text: str) -> Optional[str]:
-        """Extract command from message text (after the @mention)."""
+        """Extract command from message text (after the @mention).
+
+        Uses word boundary matching to avoid false positives.
+        """
         if not self.bot_user_id:
             return None
 
-        # Remove the mention to get the command
         mention_pattern = f"<@{self.bot_user_id}>"
-        text_after_mention = text.replace(mention_pattern, "").strip().lower()
+        if mention_pattern not in text:
+            return None
 
-        # Check for known commands
-        for cmd in self.commands:
-            if cmd in text_after_mention:
-                return cmd
+        # Get text after the mention
+        text_after_mention = text.split(mention_pattern, 1)[1].strip().lower()
 
-        # No specific command = generate new draft
+        if not text_after_mention:
+            # Just @mention with no command = generate draft
+            return "draft"
+
+        # Extract first word only (removes punctuation)
+        first_word = text_after_mention.split()[0].rstrip('.,!?;:')
+
+        # Check if first word is a known command
+        if first_word in self.commands:
+            print(f"[CMD] Matched command: {first_word}")
+            return first_word
+
+        # Unknown text = treat as new draft request
+        print(f"[CMD] Unknown command '{first_word}', treating as draft request")
         return "draft"
 
     def get_thread_messages(self, channel: str, thread_ts: str) -> list:
@@ -142,48 +157,89 @@ class SlackDraftService:
             return []
 
     def get_last_draft_from_thread(self, thread_messages: list) -> Optional[str]:
-        """Find the most recent draft in a thread (for refinement)."""
+        """Find the most recent draft in a thread (for refinement).
+
+        Uses regex for more robust extraction.
+        """
         for msg in reversed(thread_messages):
             text = msg.get("text", "")
-            if "*Draft Response*" in text or "Draft Response" in text:
-                # Extract just the draft content (between the header and footer)
-                lines = text.split("\n")
-                draft_lines = []
-                in_draft = False
-                for line in lines:
-                    if "*Draft Response*" in line or "Draft Response" in line:
-                        in_draft = True
-                        continue
-                    if line.startswith("---") or "_This is an AI-generated" in line:
-                        break
-                    if in_draft and line.strip():
-                        draft_lines.append(line)
-                if draft_lines:
-                    return "\n".join(draft_lines)
+
+            # Skip if no draft marker
+            if "Draft Response" not in text:
+                continue
+
+            # Try regex extraction first (most reliable)
+            # Pattern: *Draft Response* (optional text) \n\n CONTENT \n\n ---
+            match = re.search(
+                r'\*Draft Response\*[^\n]*\n\n(.*?)\n\n---',
+                text,
+                re.DOTALL
+            )
+            if match:
+                draft = match.group(1).strip()
+                if draft:
+                    print(f"[EXTRACT] Found draft via regex ({len(draft)} chars)")
+                    return draft
+
+            # Fallback: line-by-line parsing
+            lines = text.split("\n")
+            draft_lines = []
+            in_draft = False
+            for line in lines:
+                if "*Draft Response*" in line or "Draft Response" in line:
+                    in_draft = True
+                    continue
+                if line.startswith("---") or "_Reply with @CHFSDraftBot" in line:
+                    break
+                if in_draft and line.strip():
+                    draft_lines.append(line)
+
+            if draft_lines:
+                draft = "\n".join(draft_lines).strip()
+                print(f"[EXTRACT] Found draft via fallback ({len(draft)} chars)")
+                return draft
+
+        print(f"[EXTRACT] No draft found in {len(thread_messages)} thread messages")
         return None
 
     def parse_email_from_message(self, text: str) -> Optional[dict]:
-        """Parse email details from Power Automate message format."""
-        # Expected format: "[From] | Subject: [Subject] | Body Preview: [Body]"
-        parts = text.split(" | ")
-        if len(parts) < 3:
+        """Parse email details from inbox-monitor message format.
+
+        Expected format (first line): "[From] | Subject: [Subject] | Body Preview: [Body]"
+        Handles cases where subject/body contains pipe characters.
+        """
+        # Only parse the first line (machine-readable format)
+        first_line = text.split("\n")[0].strip()
+
+        # Use markers to split more reliably (handles pipes in content)
+        if " | Subject: " not in first_line or " | Body Preview: " not in first_line:
+            print(f"[PARSE] Missing markers in: {first_line[:80]}...")
             return None
 
-        email_data = {}
+        try:
+            # Split by Body Preview first (appears last)
+            before_body, body_part = first_line.split(" | Body Preview: ", 1)
 
-        # Extract From
-        email_data["from"] = parts[0].strip()
+            # Then split the remaining part by Subject
+            from_part, subject_part = before_body.split(" | Subject: ", 1)
 
-        # Extract Subject
-        for part in parts:
-            if part.startswith("Subject:"):
-                email_data["subject"] = part.replace("Subject:", "").strip()
-            elif part.startswith("Body Preview:"):
-                email_data["body"] = part.replace("Body Preview:", "").strip()
+            # Clean and validate
+            from_clean = from_part.strip()
+            subject_clean = subject_part.strip()
+            body_clean = body_part.strip()
 
-        if "subject" in email_data and "body" in email_data:
-            return email_data
-        return None
+            if not from_clean or not subject_clean:
+                print(f"[PARSE] Empty required field - from: '{from_clean}', subject: '{subject_clean}'")
+                return None
+
+            return {
+                "from": from_clean,
+                "subject": subject_clean,
+                "body": body_clean if body_clean else "(No preview)"
+            }
+        except ValueError as e:
+            print(f"[PARSE] Error splitting message: {e}")
+            return None
 
     def is_priority_sender(self, from_field: str) -> bool:
         """Check if the email is from Laura Paris (priority sender)."""
@@ -230,8 +286,11 @@ class SlackDraftService:
             "is_from_laura": is_from_laura
         }
 
-    def draft_response(self, email_data: dict, classification: dict) -> str:
-        """Use Gemini to draft a response in Laura's style."""
+    def draft_response(self, email_data: dict, classification: dict, retry_count: int = 0) -> str:
+        """Use Gemini to draft a response in Laura's style.
+
+        Includes retry logic with exponential backoff for rate limits.
+        """
         prompt = f"""{LAURA_STYLE_PROMPT}
 
 ## Email to respond to:
@@ -253,6 +312,9 @@ Draft a SHORT reply to this email in Laura Paris's exact style.
 
 Draft reply:"""
 
+        max_retries = 3
+        base_delay = 2
+
         try:
             response = self.genai_client.models.generate_content(
                 model=self.model_name,
@@ -261,11 +323,27 @@ Draft reply:"""
             draft = response.text.strip()
             return draft
         except Exception as e:
-            print(f"Error generating draft: {e}")
-            return f"[Error drafting response: {e}]"
+            error_msg = str(e)
+            print(f"[GEMINI] Error generating draft: {error_msg}")
 
-    def refine_draft(self, original_draft: str, command: str, email_data: dict) -> str:
-        """Refine an existing draft based on a command."""
+            # Check for rate limiting (429 errors)
+            if "429" in error_msg or "quota" in error_msg.lower() or "rate" in error_msg.lower():
+                if retry_count < max_retries:
+                    wait_time = base_delay * (2 ** retry_count)  # 2s, 4s, 8s
+                    print(f"[GEMINI] Rate limited, waiting {wait_time}s before retry {retry_count + 1}/{max_retries}")
+                    time.sleep(wait_time)
+                    return self.draft_response(email_data, classification, retry_count + 1)
+                else:
+                    print(f"[GEMINI] Max retries exceeded")
+                    return "[Error: Rate limit exceeded - please try again in a few minutes]"
+
+            return f"[Error: Could not generate draft - {type(e).__name__}]"
+
+    def refine_draft(self, original_draft: str, command: str, email_data: dict, retry_count: int = 0) -> str:
+        """Refine an existing draft based on a command.
+
+        Includes retry logic with exponential backoff for rate limits.
+        """
         command_instruction = self.commands.get(command, "Improve the draft")
 
         prompt = f"""{LAURA_STYLE_PROMPT}
@@ -287,6 +365,9 @@ Output ONLY the refined draft, nothing else.
 
 Refined draft:"""
 
+        max_retries = 3
+        base_delay = 2
+
         try:
             response = self.genai_client.models.generate_content(
                 model=self.model_name,
@@ -294,8 +375,21 @@ Refined draft:"""
             )
             return response.text.strip()
         except Exception as e:
-            print(f"Error refining draft: {e}")
-            return f"[Error refining: {e}]"
+            error_msg = str(e)
+            print(f"[GEMINI] Error refining draft: {error_msg}")
+
+            # Check for rate limiting (429 errors)
+            if "429" in error_msg or "quota" in error_msg.lower() or "rate" in error_msg.lower():
+                if retry_count < max_retries:
+                    wait_time = base_delay * (2 ** retry_count)
+                    print(f"[GEMINI] Rate limited, waiting {wait_time}s before retry {retry_count + 1}/{max_retries}")
+                    time.sleep(wait_time)
+                    return self.refine_draft(original_draft, command, email_data, retry_count + 1)
+                else:
+                    print(f"[GEMINI] Max retries exceeded")
+                    return "[Error: Rate limit exceeded - please try again in a few minutes]"
+
+            return f"[Error: Could not refine draft - {type(e).__name__}]"
 
     def post_draft_reply(self, channel: str, thread_ts: str, draft: str, classification: dict, is_refinement: bool = False):
         """Post the drafted response as a thread reply."""
@@ -395,30 +489,27 @@ _Reply with @CHFSDraftBot + command to refine:_
 
                     # Skip our own draft responses
                     if "Draft Response" in thread_msg_text:
-                        self.processed_messages.add(thread_msg_ts)
+                        self.processed_messages.append(thread_msg_ts)
                         continue
 
                     # Check for bot mention in thread reply
                     if self.contains_bot_mention(thread_msg_text):
                         self.process_mention(thread_msg_ts, thread_msg_text, msg_ts)
-                        self.processed_messages.add(thread_msg_ts)
+                        self.processed_messages.append(thread_msg_ts)
 
             # Also check top-level messages for mentions (in case someone mentions bot there)
             if msg_ts not in self.processed_messages:
                 if "Draft Response" in msg_text:
-                    self.processed_messages.add(msg_ts)
+                    self.processed_messages.append(msg_ts)
                 elif self.contains_bot_mention(msg_text):
                     self.process_mention(msg_ts, msg_text, msg_ts)
-                    self.processed_messages.add(msg_ts)
+                    self.processed_messages.append(msg_ts)
                 else:
-                    self.processed_messages.add(msg_ts)
+                    self.processed_messages.append(msg_ts)
 
         # Update timestamp for next check
         self.last_check_ts = str(time.time())
-
-        # Cleanup old processed messages (keep last 500)
-        if len(self.processed_messages) > 500:
-            self.processed_messages = set(list(self.processed_messages)[-250:])
+        # Note: processed_messages is a deque with maxlen=500, auto-evicts oldest
 
     def run(self):
         """Main run loop."""
