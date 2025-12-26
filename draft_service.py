@@ -317,85 +317,98 @@ _Reply with @CHFSDraftBot + command to refine:_
         except SlackApiError as e:
             print(f"Error posting draft: {e}")
 
+    def process_mention(self, msg_ts: str, msg_text: str, target_thread: str):
+        """Process a single mention - generate or refine a draft."""
+        print(f"[MENTION] Bot mentioned in message: {msg_ts}")
+
+        # Parse the command (draft, shorter, longer, etc.)
+        command = self.parse_command(msg_text)
+        print(f"[COMMAND] Detected command: {command}")
+
+        # Get all messages in the thread to find context
+        thread_messages = self.get_thread_messages(SLACK_CHANNEL_ID, target_thread)
+
+        # Find the original email (first message in thread should be the email notification)
+        email_data = None
+        for thread_msg in thread_messages:
+            email_data = self.parse_email_from_message(thread_msg.get("text", ""))
+            if email_data:
+                break
+
+        if not email_data:
+            # No email found in thread - let user know
+            try:
+                self.slack_client.chat_postMessage(
+                    channel=SLACK_CHANNEL_ID,
+                    thread_ts=target_thread,
+                    text=":warning: I couldn't find an email in this thread. Tag me on an email notification thread to draft a response."
+                )
+            except SlackApiError as e:
+                print(f"Error posting error message: {e}")
+            return
+
+        # Classify the email
+        classification = self.classify_email(email_data)
+
+        # Handle refinement vs new draft
+        if command != "draft" and command in self.commands:
+            # This is a refinement request - find the last draft
+            last_draft = self.get_last_draft_from_thread(thread_messages)
+            if last_draft:
+                print(f"[REFINE] Refining draft with command: {command}")
+                refined_draft = self.refine_draft(last_draft, command, email_data)
+                self.post_draft_reply(SLACK_CHANNEL_ID, target_thread, refined_draft, classification, is_refinement=True)
+            else:
+                # No previous draft found, create new one
+                print(f"[DRAFT] No previous draft found, creating new one")
+                draft = self.draft_response(email_data, classification)
+                self.post_draft_reply(SLACK_CHANNEL_ID, target_thread, draft, classification)
+        else:
+            # New draft request
+            print(f"[DRAFT] Creating new draft for: {email_data.get('subject', 'No subject')}")
+            draft = self.draft_response(email_data, classification)
+            self.post_draft_reply(SLACK_CHANNEL_ID, target_thread, draft, classification)
+
     def process_messages(self):
-        """Process messages - only respond when @mentioned."""
+        """Process messages - check channel AND thread replies for @mentions."""
         messages = self.get_recent_messages()
 
         for msg in messages:
             msg_ts = msg.get("ts", "")
             msg_text = msg.get("text", "")
-            thread_ts = msg.get("thread_ts")  # If this is a reply, thread_ts points to parent
+            reply_count = msg.get("reply_count", 0)
 
-            # Skip if already processed
-            if msg_ts in self.processed_messages:
-                continue
+            # Check if this top-level message has threads with potential mentions
+            if reply_count > 0:
+                # Scan the thread for any unprocessed mentions
+                thread_messages = self.get_thread_messages(SLACK_CHANNEL_ID, msg_ts)
+                for thread_msg in thread_messages:
+                    thread_msg_ts = thread_msg.get("ts", "")
+                    thread_msg_text = thread_msg.get("text", "")
 
-            # Skip our own messages
-            if "Draft Response" in msg_text:
-                self.processed_messages.add(msg_ts)
-                continue
+                    # Skip if already processed
+                    if thread_msg_ts in self.processed_messages:
+                        continue
 
-            # ONLY respond if @mentioned
-            if not self.contains_bot_mention(msg_text):
-                self.processed_messages.add(msg_ts)
-                continue
+                    # Skip our own draft responses
+                    if "Draft Response" in thread_msg_text:
+                        self.processed_messages.add(thread_msg_ts)
+                        continue
 
-            print(f"[MENTION] Bot mentioned in message: {msg_ts}")
+                    # Check for bot mention in thread reply
+                    if self.contains_bot_mention(thread_msg_text):
+                        self.process_mention(thread_msg_ts, thread_msg_text, msg_ts)
+                        self.processed_messages.add(thread_msg_ts)
 
-            # Parse the command (draft, shorter, longer, etc.)
-            command = self.parse_command(msg_text)
-            print(f"[COMMAND] Detected command: {command}")
-
-            # Determine which thread we're working with
-            # If it's a threaded reply, use thread_ts; otherwise use msg_ts as the thread root
-            target_thread = thread_ts if thread_ts else msg_ts
-
-            # Get all messages in the thread to find context
-            thread_messages = self.get_thread_messages(SLACK_CHANNEL_ID, target_thread)
-
-            # Find the original email (first message in thread should be the email notification)
-            email_data = None
-            for thread_msg in thread_messages:
-                email_data = self.parse_email_from_message(thread_msg.get("text", ""))
-                if email_data:
-                    break
-
-            if not email_data:
-                # No email found in thread - let user know
-                try:
-                    self.slack_client.chat_postMessage(
-                        channel=SLACK_CHANNEL_ID,
-                        thread_ts=target_thread,
-                        text=":warning: I couldn't find an email in this thread. Tag me on an email notification thread to draft a response."
-                    )
-                except SlackApiError as e:
-                    print(f"Error posting error message: {e}")
-                self.processed_messages.add(msg_ts)
-                continue
-
-            # Classify the email
-            classification = self.classify_email(email_data)
-
-            # Handle refinement vs new draft
-            if command != "draft" and command in self.commands:
-                # This is a refinement request - find the last draft
-                last_draft = self.get_last_draft_from_thread(thread_messages)
-                if last_draft:
-                    print(f"[REFINE] Refining draft with command: {command}")
-                    refined_draft = self.refine_draft(last_draft, command, email_data)
-                    self.post_draft_reply(SLACK_CHANNEL_ID, target_thread, refined_draft, classification, is_refinement=True)
+            # Also check top-level messages for mentions (in case someone mentions bot there)
+            if msg_ts not in self.processed_messages:
+                if "Draft Response" in msg_text:
+                    self.processed_messages.add(msg_ts)
+                elif self.contains_bot_mention(msg_text):
+                    self.process_mention(msg_ts, msg_text, msg_ts)
+                    self.processed_messages.add(msg_ts)
                 else:
-                    # No previous draft found, create new one
-                    print(f"[DRAFT] No previous draft found, creating new one")
-                    draft = self.draft_response(email_data, classification)
-                    self.post_draft_reply(SLACK_CHANNEL_ID, target_thread, draft, classification)
-            else:
-                # New draft request
-                print(f"[DRAFT] Creating new draft for: {email_data.get('subject', 'No subject')}")
-                draft = self.draft_response(email_data, classification)
-                self.post_draft_reply(SLACK_CHANNEL_ID, target_thread, draft, classification)
-
-            self.processed_messages.add(msg_ts)
+                    self.processed_messages.add(msg_ts)
 
         # Update timestamp for next check
         self.last_check_ts = str(time.time())
