@@ -13,7 +13,7 @@ from typing import Optional
 sys.stdout.reconfigure(line_buffering=True)
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-import google.generativeai as genai
+from google import genai
 
 # Configuration
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
@@ -66,8 +66,8 @@ You are drafting email replies in the style of Laura Paris, Executive Director a
 class SlackDraftService:
     def __init__(self):
         self.slack_client = WebClient(token=SLACK_BOT_TOKEN)
-        genai.configure(api_key=GEMINI_API_KEY)
-        self.model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        self.genai_client = genai.Client(api_key=GEMINI_API_KEY)
+        self.model_name = 'gemini-2.5-flash'
         self.processed_messages = set()
         self.last_check_ts = str(time.time())
 
@@ -179,7 +179,10 @@ Draft a SHORT reply to this email in Laura Paris's exact style.
 Draft reply:"""
 
         try:
-            response = self.model.generate_content(prompt)
+            response = self.genai_client.models.generate_content(
+                model=self.model_name,
+                contents=prompt
+            )
             draft = response.text.strip()
             return draft
         except Exception as e:
