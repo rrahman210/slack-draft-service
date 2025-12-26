@@ -91,13 +91,15 @@ class SlackDraftService:
     def get_recent_messages(self) -> list:
         """Fetch recent messages from the inbox-assistant channel."""
         try:
+            # Always look back 6 hours to catch threads with new activity
+            lookback_ts = str(time.time() - 21600)  # 6 hours
             result = self.slack_client.conversations_history(
                 channel=SLACK_CHANNEL_ID,
-                oldest=self.last_check_ts,
-                limit=20
+                oldest=lookback_ts,
+                limit=50
             )
             messages = result.get("messages", [])
-            print(f"[DEBUG] Fetched {len(messages)} messages since {self.last_check_ts}")
+            print(f"[DEBUG] Fetched {len(messages)} messages from last 6 hours")
             return messages
         except SlackApiError as e:
             print(f"Error fetching messages: {e}")
