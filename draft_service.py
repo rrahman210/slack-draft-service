@@ -67,7 +67,7 @@ class SlackDraftService:
     def __init__(self):
         self.slack_client = WebClient(token=SLACK_BOT_TOKEN)
         genai.configure(api_key=GEMINI_API_KEY)
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        self.model = genai.GenerativeModel('gemini-1.5-flash-latest')
         self.processed_messages = set()
         self.last_check_ts = str(time.time())
 
