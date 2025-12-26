@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+# Disable Python output buffering for real-time logs
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
 COPY requirements.txt .

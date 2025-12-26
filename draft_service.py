@@ -4,9 +4,13 @@ Monitors #inbox-assistant for email notifications and drafts responses in Laura 
 """
 
 import os
+import sys
 import time
 import re
 from typing import Optional
+
+# Force unbuffered output for Railway logs
+sys.stdout.reconfigure(line_buffering=True)
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 import google.generativeai as genai
