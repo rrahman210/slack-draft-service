@@ -79,7 +79,9 @@ class SlackDraftService:
                 oldest=self.last_check_ts,
                 limit=20
             )
-            return result.get("messages", [])
+            messages = result.get("messages", [])
+            print(f"[DEBUG] Fetched {len(messages)} messages since {self.last_check_ts}")
+            return messages
         except SlackApiError as e:
             print(f"Error fetching messages: {e}")
             return []
