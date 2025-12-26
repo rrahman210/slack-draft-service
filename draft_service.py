@@ -214,8 +214,8 @@ React :white_check_mark: when approved or :x: to discard."""
             if msg_ts in self.processed_messages:
                 continue
 
-            # Skip bot messages that are our own drafts
-            if "Draft Response" in msg_text or msg.get("bot_id"):
+            # Skip our own draft responses (not all bot messages - Power Automate uses bots too)
+            if "Draft Response" in msg_text:
                 self.processed_messages.add(msg_ts)
                 continue
 
