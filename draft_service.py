@@ -1,6 +1,7 @@
 """
-Slack Email Draft Service
-Monitors #inbox-assistant for email notifications and drafts responses in Laura Paris's style.
+Slack Email Draft Service - @CHFSDraftBot
+Drafts email responses in Laura Paris's style when @mentioned in Slack threads.
+Tag @CHFSDraftBot in any email thread to get a draft, then refine with commands.
 """
 
 import os
@@ -75,6 +76,16 @@ class SlackDraftService:
         self.model_name = 'gemini-2.5-flash'
         self.processed_messages = set()
         self.last_check_ts = str(time.time())
+        self.bot_user_id = None  # Set in run() via auth_test()
+
+        # Supported refinement commands
+        self.commands = {
+            "shorter": "Make the draft more concise - reduce to 1-2 sentences",
+            "longer": "Expand the draft with more detail",
+            "formal": "Make the tone more formal and professional",
+            "casual": "Make the tone more casual and friendly",
+            "rewrite": "Generate a completely new draft from scratch"
+        }
 
     def get_recent_messages(self) -> list:
         """Fetch recent messages from the inbox-assistant channel."""
@@ -90,6 +101,63 @@ class SlackDraftService:
         except SlackApiError as e:
             print(f"Error fetching messages: {e}")
             return []
+
+    def contains_bot_mention(self, text: str) -> bool:
+        """Check if message mentions this bot."""
+        if not self.bot_user_id:
+            return False
+        mention_pattern = f"<@{self.bot_user_id}>"
+        return mention_pattern in text
+
+    def parse_command(self, text: str) -> Optional[str]:
+        """Extract command from message text (after the @mention)."""
+        if not self.bot_user_id:
+            return None
+
+        # Remove the mention to get the command
+        mention_pattern = f"<@{self.bot_user_id}>"
+        text_after_mention = text.replace(mention_pattern, "").strip().lower()
+
+        # Check for known commands
+        for cmd in self.commands:
+            if cmd in text_after_mention:
+                return cmd
+
+        # No specific command = generate new draft
+        return "draft"
+
+    def get_thread_messages(self, channel: str, thread_ts: str) -> list:
+        """Get all messages in a thread."""
+        try:
+            result = self.slack_client.conversations_replies(
+                channel=channel,
+                ts=thread_ts
+            )
+            return result.get("messages", [])
+        except SlackApiError as e:
+            print(f"Error fetching thread: {e}")
+            return []
+
+    def get_last_draft_from_thread(self, thread_messages: list) -> Optional[str]:
+        """Find the most recent draft in a thread (for refinement)."""
+        for msg in reversed(thread_messages):
+            text = msg.get("text", "")
+            if "*Draft Response*" in text or "Draft Response" in text:
+                # Extract just the draft content (between the header and footer)
+                lines = text.split("\n")
+                draft_lines = []
+                in_draft = False
+                for line in lines:
+                    if "*Draft Response*" in line or "Draft Response" in line:
+                        in_draft = True
+                        continue
+                    if line.startswith("---") or "_This is an AI-generated" in line:
+                        break
+                    if in_draft and line.strip():
+                        draft_lines.append(line)
+                if draft_lines:
+                    return "\n".join(draft_lines)
+        return None
 
     def parse_email_from_message(self, text: str) -> Optional[dict]:
         """Parse email details from Power Automate message format."""
@@ -161,7 +229,6 @@ class SlackDraftService:
 
     def draft_response(self, email_data: dict, classification: dict) -> str:
         """Use Gemini to draft a response in Laura's style."""
-        # Build the prompt
         prompt = f"""{LAURA_STYLE_PROMPT}
 
 ## Email to respond to:
@@ -179,7 +246,7 @@ Draft a SHORT reply to this email in Laura Paris's exact style.
 - If it's FROM Laura, draft a reply TO Laura
 - If it needs information you don't have, write "[Need info: specific question]"
 - Keep it 1-4 sentences max
-- End with just "Laura"
+- End with the signature block
 
 Draft reply:"""
 
@@ -194,17 +261,51 @@ Draft reply:"""
             print(f"Error generating draft: {e}")
             return f"[Error drafting response: {e}]"
 
-    def post_draft_reply(self, channel: str, thread_ts: str, draft: str, classification: dict):
+    def refine_draft(self, original_draft: str, command: str, email_data: dict) -> str:
+        """Refine an existing draft based on a command."""
+        command_instruction = self.commands.get(command, "Improve the draft")
+
+        prompt = f"""{LAURA_STYLE_PROMPT}
+
+## Original Email Context:
+**From:** {email_data.get('from', 'Unknown')}
+**Subject:** {email_data.get('subject', 'No subject')}
+**Body Preview:** {email_data.get('body', 'No body')}
+
+## Current Draft:
+{original_draft}
+
+## Refinement Request: {command.upper()}
+{command_instruction}
+
+## Task:
+Rewrite the draft following the refinement request while maintaining Laura Paris's style.
+Output ONLY the refined draft, nothing else.
+
+Refined draft:"""
+
+        try:
+            response = self.genai_client.models.generate_content(
+                model=self.model_name,
+                contents=prompt
+            )
+            return response.text.strip()
+        except Exception as e:
+            print(f"Error refining draft: {e}")
+            return f"[Error refining: {e}]"
+
+    def post_draft_reply(self, channel: str, thread_ts: str, draft: str, classification: dict, is_refinement: bool = False):
         """Post the drafted response as a thread reply."""
         priority_emoji = ":rotating_light:" if "URGENT" in classification["priority"] else ":memo:"
+        refinement_note = " _(refined)_" if is_refinement else ""
 
-        message = f"""{priority_emoji} *Draft Response* ({classification['priority']})
+        message = f"""{priority_emoji} *Draft Response*{refinement_note}
 
 {draft}
 
 ---
-_This is an AI-generated draft in Laura's style. Review before sending._
-React :white_check_mark: when approved or :x: to discard."""
+_Reply with @CHFSDraftBot + command to refine:_
+`shorter` · `longer` · `formal` · `casual` · `rewrite`"""
 
         try:
             self.slack_client.chat_postMessage(
@@ -217,38 +318,82 @@ React :white_check_mark: when approved or :x: to discard."""
             print(f"Error posting draft: {e}")
 
     def process_messages(self):
-        """Main processing loop - check for new emails and draft responses."""
+        """Process messages - only respond when @mentioned."""
         messages = self.get_recent_messages()
 
         for msg in messages:
             msg_ts = msg.get("ts", "")
             msg_text = msg.get("text", "")
+            thread_ts = msg.get("thread_ts")  # If this is a reply, thread_ts points to parent
 
             # Skip if already processed
             if msg_ts in self.processed_messages:
                 continue
 
-            # Skip our own draft responses (not all bot messages - Power Automate uses bots too)
+            # Skip our own messages
             if "Draft Response" in msg_text:
                 self.processed_messages.add(msg_ts)
                 continue
 
-            # Try to parse as email notification
-            email_data = self.parse_email_from_message(msg_text)
-            if not email_data:
+            # ONLY respond if @mentioned
+            if not self.contains_bot_mention(msg_text):
                 self.processed_messages.add(msg_ts)
                 continue
 
-            print(f"Processing email: {email_data.get('subject', 'No subject')}")
+            print(f"[MENTION] Bot mentioned in message: {msg_ts}")
+
+            # Parse the command (draft, shorter, longer, etc.)
+            command = self.parse_command(msg_text)
+            print(f"[COMMAND] Detected command: {command}")
+
+            # Determine which thread we're working with
+            # If it's a threaded reply, use thread_ts; otherwise use msg_ts as the thread root
+            target_thread = thread_ts if thread_ts else msg_ts
+
+            # Get all messages in the thread to find context
+            thread_messages = self.get_thread_messages(SLACK_CHANNEL_ID, target_thread)
+
+            # Find the original email (first message in thread should be the email notification)
+            email_data = None
+            for thread_msg in thread_messages:
+                email_data = self.parse_email_from_message(thread_msg.get("text", ""))
+                if email_data:
+                    break
+
+            if not email_data:
+                # No email found in thread - let user know
+                try:
+                    self.slack_client.chat_postMessage(
+                        channel=SLACK_CHANNEL_ID,
+                        thread_ts=target_thread,
+                        text=":warning: I couldn't find an email in this thread. Tag me on an email notification thread to draft a response."
+                    )
+                except SlackApiError as e:
+                    print(f"Error posting error message: {e}")
+                self.processed_messages.add(msg_ts)
+                continue
 
             # Classify the email
             classification = self.classify_email(email_data)
 
-            # Draft a response
-            draft = self.draft_response(email_data, classification)
-
-            # Post the draft as a thread reply
-            self.post_draft_reply(SLACK_CHANNEL_ID, msg_ts, draft, classification)
+            # Handle refinement vs new draft
+            if command != "draft" and command in self.commands:
+                # This is a refinement request - find the last draft
+                last_draft = self.get_last_draft_from_thread(thread_messages)
+                if last_draft:
+                    print(f"[REFINE] Refining draft with command: {command}")
+                    refined_draft = self.refine_draft(last_draft, command, email_data)
+                    self.post_draft_reply(SLACK_CHANNEL_ID, target_thread, refined_draft, classification, is_refinement=True)
+                else:
+                    # No previous draft found, create new one
+                    print(f"[DRAFT] No previous draft found, creating new one")
+                    draft = self.draft_response(email_data, classification)
+                    self.post_draft_reply(SLACK_CHANNEL_ID, target_thread, draft, classification)
+            else:
+                # New draft request
+                print(f"[DRAFT] Creating new draft for: {email_data.get('subject', 'No subject')}")
+                draft = self.draft_response(email_data, classification)
+                self.post_draft_reply(SLACK_CHANNEL_ID, target_thread, draft, classification)
 
             self.processed_messages.add(msg_ts)
 
@@ -261,16 +406,36 @@ React :white_check_mark: when approved or :x: to discard."""
 
     def run(self):
         """Main run loop."""
-        print(f"Starting Slack Draft Service")
+        print(f"Starting Slack Draft Service - @CHFSDraftBot")
         print(f"Monitoring channel: {SLACK_CHANNEL_ID}")
         print(f"Check interval: {CHECK_INTERVAL} seconds")
         print("-" * 50)
+
+        # Get bot's user ID for mention detection
+        try:
+            auth_response = self.slack_client.auth_test()
+            self.bot_user_id = auth_response.get("user_id")
+            bot_name = auth_response.get("user", "CHFSDraftBot")
+            print(f"Bot authenticated: @{bot_name} (ID: {self.bot_user_id})")
+        except SlackApiError as e:
+            print(f"FATAL: Could not authenticate bot: {e}")
+            return
 
         # Send startup message
         try:
             self.slack_client.chat_postMessage(
                 channel=SLACK_CHANNEL_ID,
-                text=":robot_face: *AI Draft Service Started*\n\nI'll automatically draft responses in Laura's style when new emails arrive."
+                text=f""":robot_face: *CHFSDraftBot Online*
+
+Tag me in any email thread to get a draft response in Laura's style.
+
+*Commands:*
+• `@CHFSDraftBot` - Generate draft
+• `@CHFSDraftBot shorter` - Make it more concise
+• `@CHFSDraftBot longer` - Add more detail
+• `@CHFSDraftBot formal` - More formal tone
+• `@CHFSDraftBot casual` - More casual tone
+• `@CHFSDraftBot rewrite` - Fresh draft"""
             )
         except SlackApiError as e:
             print(f"Error sending startup message: {e}")
